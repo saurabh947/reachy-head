@@ -1,11 +1,8 @@
 """Tests for tts_announcer: speak_text() and announce_emotion()."""
 
-import os
-import tempfile
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
 
 
 # ---------------------------------------------------------------------------

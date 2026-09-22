@@ -1,17 +1,20 @@
 """GeminiBridge: Gemini API chat session with emotion detection as a function tool.
 
 The detect_emotion tool lets Gemini decide when to read the human's emotional
-state.  Instead of running local inference, it queries the emotion-cloud gRPC
-service via :class:`~reachy_emotion.cloud_client.EmotionCloudClient`, which
-streams camera frames continuously in the background and stores the latest
-result from the cloud.
+state.  Emotion inference is delegated to an injected *emotion client* — the
+on-device model
+(:class:`~reachy_emotion.local_inferencer.LocalEmotionInferencer`).  The bridge
+only requires that the client expose ``detect_emotion()``; it reads the current
+emotional state on demand when Gemini calls the tool (there is no background
+stream).
 
 Usage::
 
-    client = EmotionCloudClient(mini=mini, endpoint="34.x.x.x:50051")
+    from reachy_emotion.local_inferencer import LocalEmotionInferencer
+    client = LocalEmotionInferencer(mini=mini, model_path=".../phase2_best_calibrated.pt")
     client.start()
 
-    bridge = GeminiBridge(api_key="...", cloud_client=client)
+    bridge = GeminiBridge(api_key="...", emotion_client=client)
     bridge.initialize()
     response_text, emotion_result = bridge.chat("Hello Reachy!")
     bridge.shutdown()
@@ -24,7 +27,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.5-flash"
 
 # Maximum number of back-to-back tool calls Gemini may make in a single turn.
 # Guards against infinite loops if the model keeps requesting the same tool.
@@ -66,6 +69,10 @@ DEFAULT_SYSTEM_PROMPT = (
 
     "## TOOL & MOVEMENT RULES\n\n"
     "Use tools only when helpful and summarize results briefly.\n"
+    "To determine the human's emotion, feelings, or mood, ALWAYS call the "
+    "detect_emotion tool — it reads a dedicated on-device multimodal emotion "
+    "model that is more reliable than the camera. Never infer emotions from the "
+    "video yourself; call the tool and use its result.\n"
     "Use the camera for real visuals only — never invent details.\n"
     "The head can move (left/right/up/down/front).\n\n"
     "Enable head tracking when looking at a person; disable otherwise.\n\n"
@@ -78,9 +85,9 @@ DEFAULT_SYSTEM_PROMPT = (
 _DETECT_EMOTION_SCHEMA = {
     "name": "detect_emotion",
     "description": (
-        "Read the human's current emotional state from the emotion-cloud inference "
-        "service, which analyses the live camera feed. Returns the dominant emotion, "
-        "overall confidence, and derived stress / engagement / arousal metrics."
+        "Read the human's current emotional state from the emotion detection model, "
+        "which analyses the live camera feed. Returns the dominant emotion, overall "
+        "confidence, and derived stress / engagement / arousal metrics."
     ),
     "parameters": {
         "type": "object",
@@ -93,12 +100,11 @@ _DETECT_EMOTION_SCHEMA = {
 class GeminiBridge:
     """Manages a multi-turn Gemini chat session with emotion detection as a tool call.
 
-    Emotion detection is delegated entirely to the cloud: the bridge holds a
-    reference to an :class:`~reachy_emotion.cloud_client.EmotionCloudClient`
-    that streams camera frames to emotion-cloud in the background.  When Gemini
-    invokes ``detect_emotion`` the bridge just calls
-    ``cloud_client.get_latest_result()`` — no local model, no GPU needed on the
-    robot.
+    Emotion detection is delegated to an injected ``emotion_client`` (any object
+    exposing ``detect_emotion()``; the default is the on-device
+    :class:`~reachy_emotion.local_inferencer.LocalEmotionInferencer`).  When
+    Gemini invokes ``detect_emotion`` the bridge calls
+    ``emotion_client.detect_emotion()`` on demand.
 
     All robot *actions* (motion, TTS) are handled by the caller
     (conversation_app.py) after :meth:`chat` returns.
@@ -107,13 +113,13 @@ class GeminiBridge:
     def __init__(
         self,
         api_key: str,
-        cloud_client: Any,
+        emotion_client: Any,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         model: str = DEFAULT_MODEL,
     ) -> None:
         # API key is kept only until initialize() creates the client, then cleared.
         self.__api_key = api_key
-        self._cloud_client = cloud_client
+        self._emotion_client = emotion_client
         self._system_prompt = system_prompt
         self._model = model
         self._client: Any = None
@@ -254,16 +260,16 @@ class GeminiBridge:
         return " ".join(parts).strip()
 
     def _run_emotion_detection(self) -> dict:
-        """Fetch the latest emotion result from emotion-cloud and return it.
+        """Fetch the current emotion result from the emotion client and return it.
 
         Returns a JSON-serialisable dict suitable for a Gemini function response.
-        Falls back gracefully if the cloud client has no result yet (buffer
-        still warming up) or if the client is unavailable.
+        Falls back gracefully if no emotion client is configured or it has no
+        result yet.
         """
-        if self._cloud_client is None:
-            return {"error": "EmotionCloudClient not available"}
+        if self._emotion_client is None:
+            return {"error": "emotion client not available"}
 
-        result = self._cloud_client.detect_emotion()
+        result = self._emotion_client.detect_emotion()
         if result.get("dominant_emotion") != "unclear":
             self._last_emotion_result = result
         return result

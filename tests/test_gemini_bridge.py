@@ -48,18 +48,18 @@ _UNCLEAR_RESULT = {
 }
 
 
-def _make_cloud_client(result=None) -> MagicMock:
-    """Return a mock EmotionCloudClient with a pre-configured detect_emotion return value."""
+def _make_emotion_client(result=None) -> MagicMock:
+    """Return a mock emotion client with a pre-configured detect_emotion return value."""
     client = MagicMock()
     client.detect_emotion.return_value = result if result is not None else _UNCLEAR_RESULT
     return client
 
 
-def _make_bridge(cloud_client=None):
+def _make_bridge(emotion_client=None):
     from reachy_emotion.gemini_bridge import GeminiBridge
     return GeminiBridge(
         api_key="test-key",
-        cloud_client=cloud_client or _make_cloud_client(),
+        emotion_client=emotion_client or _make_emotion_client(),
         model="gemini-test",
     )
 
@@ -150,14 +150,14 @@ def test_extract_function_calls_returns_empty_for_empty_candidates():
 
 def test_run_emotion_detection_returns_error_when_no_client():
     from reachy_emotion.gemini_bridge import GeminiBridge
-    bridge = GeminiBridge(api_key="key", cloud_client=None, model="test")
+    bridge = GeminiBridge(api_key="key", emotion_client=None, model="test")
     result = bridge._run_emotion_detection()
     assert "error" in result
 
 
 def test_run_emotion_detection_returns_unclear_when_no_result():
     """detect_emotion() returning unclear is passed through as-is."""
-    bridge = _make_bridge(cloud_client=_make_cloud_client(result=None))
+    bridge = _make_bridge(emotion_client=_make_emotion_client(result=None))
     result = bridge._run_emotion_detection()
     assert result["dominant_emotion"] == "unclear"
     assert result["confidence"] == 0.0
@@ -175,7 +175,7 @@ def test_run_emotion_detection_returns_cloud_result():
         "engagement": 0.88,
         "arousal": 0.65,
     }
-    bridge = _make_bridge(cloud_client=_make_cloud_client(result=cloud_result))
+    bridge = _make_bridge(emotion_client=_make_emotion_client(result=cloud_result))
     result = bridge._run_emotion_detection()
     assert result["dominant_emotion"] == "happy"
     assert result["confidence"] == pytest.approx(0.91, abs=0.01)
@@ -184,7 +184,7 @@ def test_run_emotion_detection_returns_cloud_result():
 
 def test_run_emotion_detection_stores_last_result():
     cloud_result = {"dominant_emotion": "sad", "confidence": 0.75}
-    bridge = _make_bridge(cloud_client=_make_cloud_client(result=cloud_result))
+    bridge = _make_bridge(emotion_client=_make_emotion_client(result=cloud_result))
     bridge._run_emotion_detection()
     assert bridge._last_emotion_result == cloud_result
 
@@ -234,7 +234,7 @@ def test_chat_handles_detect_emotion_tool_call():
         "engagement": 0.9,
         "arousal": 0.6,
     }
-    bridge = _make_bridge(cloud_client=_make_cloud_client(result=cloud_result))
+    bridge = _make_bridge(emotion_client=_make_emotion_client(result=cloud_result))
     bridge._chat = MagicMock()
 
     fc = _fn_call("detect_emotion")
@@ -278,7 +278,7 @@ def test_chat_respects_max_tool_call_depth():
     from reachy_emotion.gemini_bridge import _MAX_TOOL_CALL_DEPTH
     from google.genai import types as genai_types
 
-    bridge = _make_bridge(cloud_client=_make_cloud_client(result=None))
+    bridge = _make_bridge(emotion_client=_make_emotion_client(result=None))
     bridge._chat = MagicMock()
 
     fc = _fn_call("detect_emotion")
@@ -310,7 +310,7 @@ def test_api_key_cleared_after_initialize():
 
     bridge = GeminiBridge(
         api_key="super-secret-key",
-        cloud_client=_make_cloud_client(),
+        emotion_client=_make_emotion_client(),
         model="test",
     )
 

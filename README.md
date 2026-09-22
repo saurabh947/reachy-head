@@ -1,62 +1,46 @@
 # Reachy Emotion
 
-A Gemini-powered conversation app for [Reachy Mini](https://pollen-robotics.com/reachy-mini). Talk to Reachy naturally — Gemini maintains the conversation and calls a cloud emotion detection service as a tool when it wants to read how you're feeling.
+A Gemini-powered conversation app for [Reachy Mini](https://pollen-robotics.com/reachy-mini). Talk to Reachy naturally — Gemini maintains the conversation and calls a `detect_emotion` tool when it wants to read how you're feeling.
 
-Emotion inference runs on **emotion-cloud**: a Two-Tower Multimodal Transformer (ViT-B/16 + emotion2vec) deployed on Google Kubernetes Engine. Camera frames stream continuously to the cloud in the background; Gemini decides *when* to look at the latest result.
+Emotion inference runs **on-device**: a Two-Tower Multimodal Transformer (ViT-B/16 face + emotion2vec audio, full PyTorch) runs locally on the laptop the robot is tethered to — no network hop for inference. Gemini decides *when* to read the current emotion via the tool.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Reachy Mini Robot                          │
-│                                                                     │
-│   Microphone ──► SpeechRecognition ──► text ──► GeminiBridge        │
-│                                                      │              │
-│                                           detect_emotion tool       │
-│                                                      │              │
-│                                         EmotionCloudClient          │
-│                                         (latest result store)       │
-│                                                      │              │
-│   Camera ──────────────────────────────► background gRPC stream     │
-│   Microphone (optional) ───────────────►  (15 fps, bidirectional)   │
-│                                                      │              │
-│                                         Gemini response text        │
-│                                                      │              │
-│   Speaker ◄── TTS (gTTS + pydub) ◄──────────────────┤              │
-│   Antennas/Body ◄── RecordedMoves ◄─────────────────┘              │
-└─────────────────────────────────────────────────────────────────────┘
-                                │ gRPC (bidirectional stream)
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                  emotion-cloud  (Google Kubernetes Engine)           │
-│                                                                     │
-│   gRPC server (port 50051)                                          │
-│        │                                                            │
-│   TorchServe ──► Two-Tower Transformer                              │
-│                   ├── Video: ViT-B/16 (AffectNet, 450 K faces)      │
-│                   └── Audio: emotion2vec_base                       │
-│                        ↓ bidirectional cross-attention              │
-│                   EmotionResponse                                   │
-│                   ├── dominant_emotion (8 classes)                  │
-│                   ├── confidence_scores                             │
-│                   └── stress / engagement / arousal                 │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────── Laptop (tethered to Reachy Mini) ─────────────────────┐
+│                                                                            │
+│  Reachy mic ─► SpeechRecognition ─► text ─► GeminiBridge (gemini-3.5-flash)│
+│                                                 │                          │
+│                                        detect_emotion tool (on demand)     │
+│                                                 │                          │
+│  Reachy camera + mic ─► LocalEmotionInferencer ─► EmotionDetector          │
+│                                                 │   (full PyTorch on MPS)  │
+│                                                 │   Two-Tower Transformer: │
+│                                                 │   ├─ ViT-B/16 face       │
+│                                                 │   └─ emotion2vec audio   │
+│                                                 ▼                          │
+│                              {dominant_emotion (8 classes), confidence,    │
+│                               stress / engagement / arousal}               │
+│                                                 │                          │
+│  Reachy speaker ◄─ TTS (gTTS + pydub) ◄─ Gemini response text              │
+│  Antennas / body ◄─ RecordedMove (emotion → move) ◄─────────────┘          │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Key design:** Gemini decides *when* to read emotion — it's an on-demand tool call, not a continuous loop. But the camera stream to emotion-cloud runs continuously in the background so the answer is always fresh when the tool is called.
+**Key design:** Gemini decides *when* to read emotion — it's an on-demand tool call. The emotion model runs in-process on the laptop, so inference has no network hop; the result is computed when the tool is called.
 
 ### Code structure
 
 ```
 src/reachy_emotion/
 ├── main.py               ← ReachyEmotionApp (dashboard entry point) + CLI
-├── conversation_app.py   ← core conversation loop
+├── conversation_app.py   ← core conversation loop + emotion-source resolution
 ├── gemini_bridge.py      ← Gemini chat session + detect_emotion tool
-├── cloud_client.py       ← gRPC streaming client for emotion-cloud
-├── proto/
-│   └── emotion.proto     ← gRPC service definition (stubs auto-generated)
+├── local_inferencer.py   ← LocalEmotionInferencer: in-process emotion model (default)
+├── local_capture.py      ← camera+mic reader from the Reachy daemon (mini.media.*)
+├── emotion_moves.py      ← emotion label → RecordedMove resolution (curated)
 ├── voice_input.py        ← STT from Reachy mic (energy VAD + Google STT)
 ├── tts_announcer.py      ← speak_text() → gTTS + pydub → Reachy speaker
 ├── reachy_handler.py     ← ActionCommand → RecordedMoves / Motion
@@ -70,7 +54,7 @@ src/reachy_emotion/
 - Python 3.10–3.12
 - Reachy Mini robot (or `--text` / `--sim` for testing without hardware)
 - A Gemini API key — free tier at [aistudio.google.com](https://aistudio.google.com/app/apikey)
-- **emotion-cloud** deployed and reachable — see the [emotion-cloud repo](https://github.com/saurabh947/emotion-cloud) for GKE setup
+- The local emotion model checkpoint (`phase2_best_calibrated.pt`) — set `EMOTION_MODEL_PATH` to it. Full PyTorch; runs on Apple Silicon (MPS) or CPU. The audio backbone (emotion2vec) downloads once on first run.
 - System packages: `ffmpeg` (TTS) and `portaudio` (microphone)
 
 ---
@@ -85,7 +69,7 @@ cd reachy-emotion
 ./install.sh
 ```
 
-This single command installs system packages (`ffmpeg` + `portaudio`), all Python dependencies (including `grpcio` and `grpcio-tools`), and creates a `.env` template.
+This single command installs system packages (`ffmpeg` + `portaudio`), all Python dependencies (including `torch` and `torchaudio`), and creates a `.env` template.
 
 ```bash
 ./install.sh --dry-run    # preview without making changes
@@ -107,32 +91,24 @@ pip install -e .        # all Python dependencies
 reachy-emotion-setup    # system dependencies (ffmpeg, portaudio)
 ```
 
-> **Note:** gRPC stubs (`emotion_pb2.py`, `emotion_pb2_grpc.py`) are generated automatically from `proto/emotion.proto` on first run using `grpcio-tools`. No manual `protoc` step needed.
-
 ---
 
 ## Configuration
 
 ```bash
 cp .env.example .env
-# Edit .env — set GEMINI_API_KEY and EMOTION_CLOUD_ENDPOINT
+# Edit .env — set GEMINI_API_KEY and EMOTION_MODEL_PATH
 ```
 
 | Variable | Required | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | Yes | From [aistudio.google.com](https://aistudio.google.com/app/apikey) |
-| `EMOTION_CLOUD_ENDPOINT` | Yes | GKE external IP + port, e.g. `34.x.x.x:50051` |
-| `GEMINI_MODEL` | No | Default: `gemini-2.5-flash` |
+| `EMOTION_MODEL_PATH` | Yes\* | Path to the local checkpoint (`.pt`), e.g. `../emotion-detection-action/outputs/phase2_best_calibrated.pt`. |
+| `EMOTION_DEVICE` | No | Torch device for the local model. Default: `mps` |
+| `GEMINI_MODEL` | No | Default: `gemini-3.5-flash` |
 | `GEMINI_SYSTEM_PROMPT` | No | Single-line override of Reachy's personality prompt |
 
-### Finding the emotion-cloud endpoint
-
-```bash
-# From the emotion-cloud repo, after deploying to GKE:
-kubectl get svc emotion-cloud-grpc -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-# Returns something like: 34.102.x.x
-# Use as: EMOTION_CLOUD_ENDPOINT=34.102.x.x:50051
-```
+\* Required for emotion detection. If unset, emotion detection is disabled and Gemini still converses.
 
 ---
 
@@ -170,7 +146,6 @@ reachy-emotion                                        # voice mode
 reachy-emotion --text                                 # text mode
 reachy-emotion --sim                                  # simulation mode
 reachy-emotion --lang fr-FR                           # French
-reachy-emotion --cloud-endpoint 34.x.x.x:50051       # override endpoint
 ```
 
 | Flag | Description |
@@ -181,7 +156,6 @@ reachy-emotion --cloud-endpoint 34.x.x.x:50051       # override endpoint
 | `--prompt TEXT` | Override system prompt for this session |
 | `--sim` | Simulation mode |
 | `--media-backend` | Reachy media backend: `default`, `gstreamer`, `webrtc` |
-| `--cloud-endpoint` | emotion-cloud gRPC address (overrides `EMOTION_CLOUD_ENDPOINT`) |
 
 Or launch from the **Reachy Mini Dashboard** — no terminal needed.
 
@@ -214,26 +188,22 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-The unit tests stub out all robot hardware, the Gemini API, and gRPC — no robot, no internet connection, and no running emotion-cloud instance is needed.
+The unit tests stub out all robot hardware, the Gemini API, and the emotion model — no robot, no internet connection, and no model download is needed.
 
 ---
 
 ## Troubleshooting
 
-### `EMOTION_CLOUD_ENDPOINT is not set`
-Add the GKE LoadBalancer IP to your `.env`:
-```bash
-# Get the IP from GKE:
-kubectl get svc emotion-cloud-grpc -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-# Then set in .env:
-EMOTION_CLOUD_ENDPOINT=34.x.x.x:50051
-```
+### Emotion detection is disabled / always "unclear"
+Set `EMOTION_MODEL_PATH` to the local checkpoint (see [Configuration](#configuration)). If it is unset, emotion detection is off and Gemini simply converses without it.
 
-### `emotion-cloud health check failed`
-The app logs a warning and continues — emotion detection will return "unclear" until the cloud is reachable. Check:
-- emotion-cloud is deployed: `kubectl get pods`
-- The service has an external IP: `kubectl get svc emotion-cloud-grpc`
-- Port 50051 is reachable from the robot's network
+### First run is slow / needs the network
+On the first local run the emotion2vec audio backbone (~1 GB) downloads once to the model cache; later runs work offline. Warm it ahead of time by running the app (or `python scripts/smoke_load.py`) once while online.
+
+### Local model fails to load
+- Confirm `EMOTION_MODEL_PATH` points to an existing `.pt` checkpoint.
+- Ensure `torch` + `torchaudio` are installed (they ship as dependencies).
+- Try `EMOTION_DEVICE=cpu` if the `mps` device misbehaves.
 
 ### `ffmpeg not found`
 Required for TTS (gTTS outputs MP3, robot speaker needs WAV).
@@ -245,13 +215,6 @@ reachy-emotion-setup   # auto-detects OS and installs ffmpeg + portaudio
 Install the Reachy Mini SDK or run in simulation mode:
 ```bash
 reachy-emotion --sim --text
-```
-
-### gRPC stubs not generating
-The stubs (`emotion_pb2.py`, `emotion_pb2_grpc.py`) are auto-generated from `proto/emotion.proto` on first run. If generation fails:
-```bash
-pip install grpcio-tools
-# Then run the app — stubs are generated automatically at startup
 ```
 
 ---

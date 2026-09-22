@@ -13,10 +13,10 @@ dependencies = [
     "reachy-mini>=1.0.0",
     # Emotion detection action SDK — ActionCommand / BaseActionHandler types used by reachy_handler
     "emotion-detection-action @ git+https://github.com/saurabh947/emotion-detector.git",
-    # gRPC client for emotion-cloud inference service
-    "grpcio>=1.62.0",
-    "grpcio-tools>=1.62.0",
-    "protobuf>=4.25.0",
+    # Local emotion model runtime (full PyTorch on-device). torchaudio is required transitively
+    # by emotion2vec/funasr; declaring it explicitly avoids the import crash the SDK hits without it.
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
     # Vision
     "opencv-python>=4.8.0",
     "numpy>=1.24.0",
@@ -48,10 +48,6 @@ reachy_emotion = "reachy_emotion.main:ReachyEmotionApp"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
-include-package-data = true
-
-[tool.setuptools.package-data]
-"reachy_emotion" = ["proto/emotion.proto"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

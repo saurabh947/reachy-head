@@ -3,7 +3,7 @@
 
 Reachy listens to you via its microphone, talks with Gemini, and reads your
 emotion on-demand when Gemini decides to call the detect_emotion tool.
-Emotion inference runs on emotion-cloud (GKE) via a persistent gRPC stream.
+Emotion inference runs on-device via a local, full-PyTorch model.
 
 Dashboard app : ReachyEmotionApp  (registered as "reachy_emotion")
 CLI script    : reachy-emotion --help
@@ -33,26 +33,25 @@ try:
 
         Configure via .env:
             GEMINI_API_KEY   — required
-            GEMINI_MODEL     — optional (default: gemini-2.5-flash)
+            GEMINI_MODEL     — optional (default: gemini-3.5-flash)
         """
 
         custom_app_url: str | None = None
 
         def run(self, reachy_mini: "ReachyMini", stop_event: threading.Event) -> None:
+            import asyncio
+
             from reachy_emotion.system_deps import check_and_warn
-            from reachy_emotion.conversation_app import (
-                run_conversation_loop,
-                _load_model,
-                _load_cloud_endpoint,
-            )
+            from reachy_emotion.conversation_app import _resolve_emotion_client
+            from reachy_emotion.live_conversation import run_live_conversation
 
             check_and_warn()
-            run_conversation_loop(
+            emotion_client = _resolve_emotion_client(reachy_mini)
+            asyncio.run(run_live_conversation(
                 mini=reachy_mini,
                 stop_event=stop_event,
-                model=_load_model(),
-                cloud_endpoint=_load_cloud_endpoint(),
-            )
+                emotion_client=emotion_client,
+            ))
 
 except ImportError:
     class ReachyEmotionApp:  # type: ignore[no-redef]
@@ -85,23 +84,19 @@ def main() -> None:
                         help="Simulation mode (start the daemon with --sim first; "
                              "macOS: mjpython -m reachy_mini.daemon.app.main --sim)")
     parser.add_argument("--text", action="store_true",
-                        help="Text input instead of voice (useful for testing)")
+                        help="Text mode: type input (voice mode uses Gemini Live streaming)")
     parser.add_argument("--lang", default="en-US",
                         help="STT/TTS language code (default: en-US)")
     parser.add_argument("--model", default=None,
-                        help="Gemini model name (default: from GEMINI_MODEL env or gemini-2.5-flash)")
+                        help="Gemini model name (default: from GEMINI_MODEL env or gemini-3.5-flash)")
     parser.add_argument("--media-backend", default="default",
                         choices=["default", "gstreamer", "webrtc"],
                         help="Reachy media backend")
     parser.add_argument("--prompt", default=None,
                         help="Override Gemini system prompt")
-    parser.add_argument("--cloud-endpoint", default=None,
-                        dest="cloud_endpoint",
-                        help="emotion-cloud gRPC address (default: from EMOTION_CLOUD_ENDPOINT env)")
     args = parser.parse_args()
 
     from reachy_emotion.system_deps import check_and_warn
-    from reachy_emotion.conversation_app import run_conversation_loop, _load_model, _load_cloud_endpoint
 
     check_and_warn()
 
@@ -116,15 +111,29 @@ def main() -> None:
 
     stop_event = threading.Event()
     with ReachyMini(media_backend=args.media_backend) as mini:
-        run_conversation_loop(
-            mini=mini,
-            stop_event=stop_event,
-            system_prompt=args.prompt,
-            voice_mode=not args.text,
-            language=args.lang,
-            model=args.model or _load_model(),
-            cloud_endpoint=args.cloud_endpoint or _load_cloud_endpoint(),
-        )
+        if args.text:
+            # Text mode: type input, Gemini text reply, spoken via TTS.
+            from reachy_emotion.conversation_app import run_conversation_loop, _load_model
+            run_conversation_loop(
+                mini=mini,
+                stop_event=stop_event,
+                system_prompt=args.prompt,
+                voice_mode=False,
+                language=args.lang,
+                model=args.model or _load_model(),
+            )
+        else:
+            # Voice mode: Gemini 3.8 Live streaming session.
+            import asyncio
+            from reachy_emotion.conversation_app import _resolve_emotion_client
+            from reachy_emotion.live_conversation import run_live_conversation
+            emotion_client = _resolve_emotion_client(mini)
+            asyncio.run(run_live_conversation(
+                mini=mini,
+                stop_event=stop_event,
+                system_prompt=args.prompt,
+                emotion_client=emotion_client,
+            ))
 
 
 if __name__ == "__main__":

@@ -13,8 +13,8 @@ Flow per turn
 Configuration
 ─────────────
 Set GEMINI_API_KEY          in .env (required).
-Set EMOTION_CLOUD_ENDPOINT  in .env (required for emotion detection).
-Set GEMINI_MODEL            in .env (optional, default: gemini-2.5-flash).
+Set EMOTION_MODEL_PATH      in .env (path to the local emotion model checkpoint).
+Set GEMINI_MODEL            in .env (optional, default: gemini-3.5-flash).
 Set GEMINI_SYSTEM_PROMPT    in .env (optional, single-line override).
 """
 
@@ -74,10 +74,41 @@ def _load_system_prompt() -> str | None:
     return os.environ.get("GEMINI_SYSTEM_PROMPT", "").strip() or None
 
 
-def _load_cloud_endpoint() -> str | None:
-    """Return EMOTION_CLOUD_ENDPOINT from env if set, otherwise None."""
+def _load_local_model_path() -> str | None:
+    """Return EMOTION_MODEL_PATH from env if set, otherwise None."""
     _load_env()
-    return os.environ.get("EMOTION_CLOUD_ENDPOINT", "").strip() or None
+    return os.environ.get("EMOTION_MODEL_PATH", "").strip() or None
+
+
+def _load_emotion_device() -> str:
+    """Return EMOTION_DEVICE from env, or the on-device default ('mps')."""
+    _load_env()
+    return os.environ.get("EMOTION_DEVICE", "").strip() or "mps"
+
+
+def _resolve_emotion_client(mini: Any) -> Any | None:
+    """Build the local emotion inferencer from EMOTION_MODEL_PATH, or return None.
+
+    Returns a started client exposing ``detect_emotion()`` / ``stop()``. When
+    EMOTION_MODEL_PATH is unset (or the model fails to load), emotion detection
+    is disabled and Gemini simply converses without it.
+    """
+    model_path = _load_local_model_path()
+    if not model_path:
+        logger.info("EMOTION_MODEL_PATH not set — emotion detection disabled")
+        return None
+
+    from reachy_emotion.local_inferencer import LocalEmotionInferencer
+
+    device = _load_emotion_device()
+    client = LocalEmotionInferencer(mini=mini, model_path=model_path, device=device)
+    try:
+        client.start()
+        logger.info("Emotion source: local model (%s, device=%s)", model_path, device)
+        return client
+    except Exception as exc:
+        logger.warning("Local emotion model setup failed: %s — emotion detection disabled", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -97,22 +128,25 @@ def _get_recorded_moves(library: str) -> Any | None:
 
 
 def _react_to_emotion(emotion_result: dict, mini: Any) -> None:
-    """Play a RecordedMove matching the dominant emotion returned by emotion-cloud."""
+    """Play a RecordedMove matching the dominant emotion from the emotion model."""
     try:
+        from reachy_emotion.emotion_moves import resolve_move
         from reachy_emotion.reachy_handler import EMOTIONS_LIBRARY
 
         recorded_moves = _get_recorded_moves(EMOTIONS_LIBRARY)
         if recorded_moves is None:
             return
 
-        moves = recorded_moves.list_moves()
-        emotion_label = emotion_result.get("dominant_emotion", "").lower()
-        if not emotion_label or emotion_label == "unclear":
+        emotion_label = emotion_result.get("dominant_emotion", "")
+        if not emotion_label or emotion_label.lower() == "unclear":
             return
 
-        match = next((m for m in moves if emotion_label in m.lower()), None)
+        # Curated, suffix-tolerant resolution against the real library vocabulary.
+        # The old `label in move_name` substring test resolved only 3 of the 8
+        # model labels (furious1/cheerful1/fear1/... never contain the label word).
+        match = resolve_move(emotion_label, recorded_moves.list_moves())
         if match:
-            logger.info("Playing move: %s", match)
+            logger.info("Playing move for %s: %s", emotion_label, match)
             mini.play_move(recorded_moves.get(match), initial_goto_duration=1.0)
     except Exception as exc:
         logger.debug("Emotion reaction skipped: %s", exc)
@@ -129,7 +163,6 @@ def run_conversation_loop(
     voice_mode: bool = True,
     language: str = "en-US",
     model: str | None = None,
-    cloud_endpoint: str | None = None,
 ) -> None:
     """Drive the listen → Gemini → react → speak cycle until stop_event is set.
 
@@ -141,35 +174,20 @@ def run_conversation_loop(
         voice_mode: True = listen via mic; False = read from stdin.
         language: BCP-47 language code for STT/TTS (e.g. "en-US", "fr-FR").
         model: Gemini model name. Falls back to GEMINI_MODEL env / DEFAULT_MODEL.
-        cloud_endpoint: emotion-cloud gRPC address (e.g. "34.x.x.x:50051").
-            Falls back to EMOTION_CLOUD_ENDPOINT env var.
     """
-    from reachy_emotion.cloud_client import EmotionCloudClient
     from reachy_emotion.gemini_bridge import GeminiBridge, DEFAULT_SYSTEM_PROMPT
     from reachy_emotion.tts_announcer import speak_text
     from reachy_emotion.voice_input import listen
 
-    # Resolve cloud endpoint: explicit arg > env var > None (emotion detection disabled).
-    endpoint = cloud_endpoint or _load_cloud_endpoint()
-
     # Resolve system prompt: explicit arg > env var > built-in default.
     resolved_prompt = system_prompt or _load_system_prompt() or DEFAULT_SYSTEM_PROMPT
 
-    # Set up emotion cloud client if an endpoint is configured.
-    cloud_client = None
-    if endpoint:
-        cloud_client = EmotionCloudClient(mini=mini, endpoint=endpoint)
-        try:
-            cloud_client.start()
-        except Exception as exc:
-            logger.warning("EmotionCloudClient setup failed: %s — emotion detection disabled", exc)
-            cloud_client = None
-    else:
-        logger.info("No EMOTION_CLOUD_ENDPOINT set — emotion detection disabled")
+    # Emotion source: the local model (EMOTION_MODEL_PATH), or None if unset.
+    emotion_client = _resolve_emotion_client(mini)
 
     bridge = GeminiBridge(
         api_key=_load_api_key(),
-        cloud_client=cloud_client,
+        emotion_client=emotion_client,
         system_prompt=resolved_prompt,
         model=model or _load_model(),
     )
@@ -179,8 +197,8 @@ def run_conversation_loop(
     except Exception as exc:
         logger.error("Failed to initialise GeminiBridge: %s", exc)
         bridge.shutdown()
-        if cloud_client is not None:
-            cloud_client.stop()
+        if emotion_client is not None:
+            emotion_client.stop()
         return
 
     if voice_mode:
@@ -252,5 +270,5 @@ def run_conversation_loop(
         except Exception:
             pass
         bridge.shutdown()
-        if cloud_client is not None:
-            cloud_client.stop()
+        if emotion_client is not None:
+            emotion_client.stop()
