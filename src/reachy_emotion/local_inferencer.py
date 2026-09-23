@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Optional
 
 import numpy as np
@@ -30,7 +31,13 @@ from reachy_emotion.local_capture import ReachySensorCapture
 logger = logging.getLogger(__name__)
 
 _UNCLEAR = "unclear"
-_DEFAULT_WARMUP_FRAMES = 16
+# The SDK samples its 16 frames evenly over the last 3 s of calls
+# (Config.two_tower_video_window_seconds); until the calls span that window the
+# clip repeats a few frames, so results are indicative only.
+_DEFAULT_WARMUP_S = 3.0
+# A continuous loop refreshes the latest result every ~0.5 s; anything older means
+# no loop is running (text mode) or the camera stopped, so take a fresh reading.
+_FRESH_S = 2.0
 
 
 def _to_mono(audio: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -65,9 +72,10 @@ class LocalEmotionInferencer:
         mini: Connected ReachyMini (used to build a capture if none is given).
         model_path: Path to the fine-tuned two-tower checkpoint (.pt).
         device: Torch device for the model ("mps" | "cpu" | "cuda").
-        warmup_frames: Results before this many frames carry ``"warming": True``
-            (the SDK repeat-pads a cold 16-frame buffer, so early predictions are
-            unreliable).
+        warmup_s: Results carry ``"warming": True`` until consecutive calls span
+            this many seconds (the SDK's frame window; a gap longer than it
+            empties the window, so warm-up restarts — text mode's one-shot
+            readings are always warming).
         capture: Optional pre-built capture (injected in tests).
         detector: Optional pre-built detector (injected in tests; skips model load).
     """
@@ -77,18 +85,22 @@ class LocalEmotionInferencer:
         mini: Any = None,
         model_path: Optional[str] = None,
         device: str = "mps",
-        warmup_frames: int = _DEFAULT_WARMUP_FRAMES,
+        warmup_s: float = _DEFAULT_WARMUP_S,
         capture: Optional[ReachySensorCapture] = None,
         detector: Any = None,
     ) -> None:
         self._mini = mini
         self._model_path = model_path
         self._device = device
-        self._warmup_frames = warmup_frames
+        self._warmup_s = warmup_s
         self._capture = capture
         self._detector = detector
-        self._latest: Optional[dict] = None
-        self._frame_count = 0
+        # (result, monotonic time) stored as one tuple so readers never pair a
+        # result with another result's timestamp.
+        self._latest: tuple[Optional[dict], float] = (None, 0.0)
+        # Start and last time of the current unbroken run of process() calls.
+        self._window_start: Optional[float] = None
+        self._last_call = 0.0
         # Serialises process() so a background warm-up loop and an on-demand
         # detect_emotion() call can't run the detector concurrently (its rolling
         # buffers + GRU state are not thread-safe).
@@ -124,11 +136,14 @@ class LocalEmotionInferencer:
                 logger.debug("detector.shutdown failed: %s", exc)
 
     def reset(self) -> None:
-        """Reset temporal state + warm-up counter (call on subject change)."""
-        self._frame_count = 0
-        self._latest = None
-        if self._detector is not None:
-            self._detector.reset()
+        """Reset the frame/audio window + warm-up (call on subject change)."""
+        # Under the lock: a reset between the SDK's add-frame and infer steps
+        # would make process_frame() return None mid-call.
+        with self._lock:
+            self._window_start = None
+            self._latest = (None, 0.0)
+            if self._detector is not None:
+                self._detector.reset()
 
     # ------------------------------------------------------------------ #
     # Inference                                                            #
@@ -143,24 +158,27 @@ class LocalEmotionInferencer:
             raise RuntimeError("LocalEmotionInferencer.start() must be called first.")
         with self._lock:
             result = self._detector.process_frame(frame_bgr, _to_mono(audio))
-            self._frame_count += 1
+            now = time.monotonic()
+            if self._window_start is None or now - self._last_call > self._warmup_s:
+                self._window_start = now  # first call, or a gap emptied the SDK window
+            self._last_call = now
             out = _result_to_dict(result)
-            if self._frame_count < self._warmup_frames:
+            if now - self._window_start < self._warmup_s:
                 out["warming"] = True
-            self._latest = out
+            self._latest = (out, now)
         return out
 
     def detect_emotion(self) -> dict:
-        """Return the latest emotion result (Gemini ``detect_emotion`` tool seam).
+        """Return the current emotion result (Gemini ``detect_emotion`` tool seam).
 
-        Prefers the result kept fresh by the continuous loop; if none exists yet
-        (e.g. text mode with no loop), does a single capture+inference.
+        Returns the result the continuous loop keeps fresh; if there is none or it
+        is stale (text mode has no loop; or the camera stopped), does a fresh
+        capture+inference instead of replaying an old reading.
         """
-        # Snapshot the reference once: the continuous behaviour loop may replace
-        # or reset() self._latest from another thread between the check and the
-        # return. Reading into a local avoids handing back None mid-reset.
-        latest = self._latest
-        if latest is not None:
+        # Snapshot once: the continuous loop may replace or reset() self._latest
+        # from another thread between the check and the return.
+        latest, stamp = self._latest
+        if latest is not None and time.monotonic() - stamp < _FRESH_S:
             return latest
         if self._capture is None:
             return {"dominant_emotion": _UNCLEAR, "confidence": 0.0, "note": "no capture available"}
@@ -171,4 +189,4 @@ class LocalEmotionInferencer:
 
     @property
     def latest(self) -> Optional[dict]:
-        return self._latest
+        return self._latest[0]

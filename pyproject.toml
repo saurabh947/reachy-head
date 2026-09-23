@@ -11,8 +11,11 @@ requires-python = ">=3.10"
 dependencies = [
     # Reachy Mini robot SDK
     "reachy-mini>=1.0.0",
-    # Emotion detection action SDK — ActionCommand / BaseActionHandler types used by reachy_handler
-    "emotion-detection-action @ git+https://github.com/saurabh947/emotion-detector.git",
+    # Emotion detection action SDK (the local emotion model + ActionCommand / BaseActionHandler
+    # types). Pinned to 7823c53, which fixes the flat near-uniform live inference (untrained
+    # GRU skipped, time-based frame window). pip keeps an existing install of the same
+    # version, so upgrade an old venv with: pip install --force-reinstall --no-deps "<this>"
+    "emotion-detection-action @ git+https://github.com/saurabh947/emotion-detection-action.git@7823c53b08047c6a4bad2197d21b3dc2c1cf6a1f",
     # Local emotion model runtime (full PyTorch on-device). torchaudio is required transitively
     # by emotion2vec/funasr; declaring it explicitly avoids the import crash the SDK hits without it.
     "torch>=2.0.0",

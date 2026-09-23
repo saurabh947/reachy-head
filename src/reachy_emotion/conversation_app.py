@@ -75,9 +75,26 @@ def _load_system_prompt() -> str | None:
 
 
 def _load_local_model_path() -> str | None:
-    """Return EMOTION_MODEL_PATH from env if set, otherwise None."""
+    """Return EMOTION_MODEL_PATH from env if set, otherwise None.
+
+    A relative path written in .env is resolved against that .env's folder, not
+    the process cwd — the dashboard (and any launch from another directory)
+    starts the app elsewhere, which would otherwise silently disable emotion.
+    """
     _load_env()
-    return os.environ.get("EMOTION_MODEL_PATH", "").strip() or None
+    path = os.path.expanduser(os.environ.get("EMOTION_MODEL_PATH", "").strip())
+    if not path:
+        return None
+    if not os.path.isabs(path):
+        try:
+            from dotenv import dotenv_values, find_dotenv
+
+            env_file = find_dotenv()
+            if env_file and (dotenv_values(env_file).get("EMOTION_MODEL_PATH") or "").strip() == path:
+                path = os.path.join(os.path.dirname(env_file), path)
+        except ImportError:
+            pass
+    return path
 
 
 def _load_emotion_device() -> str:

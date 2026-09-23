@@ -48,6 +48,8 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · 🔒 = blocked on human
   - **Live hardening (from on-robot debugging):** default model → `gemini-3.5-flash` (2.5 deprecated for new users; live model `gemini-3.8-live` via `GEMINI_LIVE_MODEL`); **audio-in pump reads the mic in real time** (was pulling 1 buffer per 20 ms + sleeping → GStreamer `drop=True` discarded the rest → garbled speech); **`session.receive()` re-entered per turn** (it ends on `turn_complete`, so the session was dropping after one reply); **local model runs in a continuous warm loop** so `detect_emotion` returns a fresh read (single mic reader fanned to Gemini + a shared thread-safe `_AudioRing`; inference lock; ~0.1 s gap for smooth audio); **system prompt** tells Gemini to always call `detect_emotion` for emotion instead of eyeballing the video.
 - [x] `W4-C2` Live tool answers from the local detector + plays the matching RecordedMove (`_receive_loop` → `detect_emotion` → `_react_to_emotion`); fires reliably now via the system-prompt nudge. Continuous emotion→motion loop still → W4-B2 (hardware).
 - [ ] `W4-D1` Full demo video 🔒hardware
+- [x] `W4-E1` **Gemini Robotics ER 2 brain** (roadmap M1): `reachy_emotion/scene_brain.py` + Live tools `look_at_scene` (ER 2 points → `look_at_image` head gaze, all targets computed from the frame's capture pose) and `plan_task` (ordered locate/grasp/place/move steps for the future SO-101). ER calls run in background tasks with a 20 s timeout so model audio keeps flowing. **Gate PASSED on hardware (2026-09-23):** scene description, find-by-query, and plan all work; the head gazes at found objects.
+- [x] `W4-E2` **Emotion SDK → `7823c53`** (pinned in `pyproject.toml`): fixes the flat near-uniform live output (untrained GRU now skipped; frames sampled over a 3 s time window). `LocalEmotionInferencer` warm-up is now time-based (3 s of calls; restarts after a gap) and `reset()` holds the inference lock. Gate PASSED: real labelled clips replayed in real time through `LocalEmotionInferencer` on MPS at the live loop's call rate give confident, correct labels (likely training clips, so optimistic).
 
 **AUDIT after 4A+4B.**
 
@@ -63,9 +65,9 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · 🔒 = blocked on human
 - [ ] `W6-2` Substack + demo video 🔒human
 - [ ] `W6-3` Clean-machine install check 🔒human
 
-## Handoff — needs you (updated 2026-09-22)
+## Handoff — needs you (updated 2026-09-23)
 
-**117 tests green, ruff clean, zero regressions.** The app runs the on-device model (`EMOTION_MODEL_PATH`) and,
+**146 tests green, ruff clean, zero regressions.** The app runs the on-device model (`EMOTION_MODEL_PATH`) and,
 in voice mode, a Gemini 3.8 Live streaming session — **validated end-to-end on the real robot** (Gemini access
 required enabling billing on the key; the `gemini-2.5-flash` default was also swapped to `gemini-3.5-flash`).
 Multi-turn conversation, the `detect_emotion` tool, and emotion→move playback all work live. All three earlier
@@ -82,14 +84,15 @@ work is gated on hardware / your accounts:
 | `W5-B1` extension: sound-localization or MuJoCo | hardware / your pick | confirm the ReSpeaker array, or `pip install reachy-mini[mujoco]` |
 | `W6` HF Space + Substack + video | your accounts | — |
 
-**Known Live limitation:** barge-in doesn't yet flush already-buffered speaker audio (interrupting keeps
-playing queued speech briefly). An enhancement, not a blocker. (Model transcripts DO log — the SDK sends
-`output_transcription` regardless.)
+**Live logging:** both sides of the conversation log (`User   →` / `Reachy →`, input transcription enabled),
+and scene tool calls log their arguments (`look_at_scene({'query': …})`). Barge-in flushes queued speaker audio.
 
 ## Audit log
 - **Audit #1** (after 1A + 3A/3B): reviewed `local_capture.py`, `local_inferencer.py`, pyproject change, `smoke_load.py`. 1 real bug found + fixed — check-then-return race in `LocalEmotionInferencer.detect_emotion()` could return `None` to Gemini during a concurrent `reset()` (snapshot the reference). No other real bugs; dict shape verified cloud-compatible; 88 tests green.
 - **Audit #2** (after 4A + 4B1): reviewed `emotion_moves.py` + `_react_to_emotion`. No real bugs (empirically confirmed all 8 labels resolve to real moves against the full 81-move library; no cross-label prefix collisions; unclear/none handled). 1 lint fix (unused import). 111 tests green + ruff clean.
 - **Audit #3** (after cloud-delete + Live rewrite): dangling-reference sweep clean (no `cloud_client`/`proto`/`EMOTION_CLOUD`/`_load_cloud_endpoint` left in src/tests/root); Live API methods + config verified against installed google-genai 1.70.0; receive-loop + format helpers unit-tested. No real bugs. Noted (not bugs): barge-in buffer flush + transcript logging deferred to the hardware gate. 114 tests green + ruff clean.
+- **Audit #4** (after ER 2): 5 real bugs fixed — text-mode `detect_emotion` replayed a stale reading forever (now re-reads after 2 s); `_AudioRing` grew unbounded with emotion disabled (capped on append); barge-in didn't flush queued speech (`clear_player` on `interrupted`); relative `EMOTION_MODEL_PATH` resolved against the cwd (now the `.env` folder); Live task failures were swallowed (now logged).
+- **On-robot review** (2026-09-23, from the ER 2 run log): Ctrl-C printed a traceback + two "Task exception was never retrieved" errors (session tasks now cancelled and collected before the socket closes; `main.py` handles Ctrl-C); Reachy claimed head moves it never made ("I'm looking right at you!") because the default prompt advertised nonexistent head control/tracking (removed; scene prompt now says the head moves only via `look_at_scene`).
 - **On-robot debugging session** (2026-09-22): brought the Live path from first-connect to a working multi-turn conversation. Fixed, in order: Gemini project access (user enabled billing) + default model `gemini-2.5-flash`→`gemini-3.5-flash`; garbled mic audio (real-time drain, no artificial sleep); session dropping after one reply (`receive()` re-entered per turn); cold/stale emotion reads (continuous warm loop + mic fan-out `_AudioRing` + inference lock); Gemini bypassing the tool (system-prompt nudge to always use `detect_emotion`). Each verified with unit tests + a live run; 117 tests green + ruff clean throughout.
 
 ---

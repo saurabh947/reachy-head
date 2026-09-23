@@ -9,27 +9,23 @@ Emotion inference runs **on-device**: a Two-Tower Multimodal Transformer (ViT-B/
 ## Architecture
 
 ```
-┌──────────────────── Laptop (tethered to Reachy Mini) ─────────────────────┐
-│                                                                            │
-│  Reachy mic ─► SpeechRecognition ─► text ─► GeminiBridge (gemini-3.5-flash)│
-│                                                 │                          │
-│                                        detect_emotion tool (on demand)     │
-│                                                 │                          │
-│  Reachy camera + mic ─► LocalEmotionInferencer ─► EmotionDetector          │
-│                                                 │   (full PyTorch on MPS)  │
-│                                                 │   Two-Tower Transformer: │
-│                                                 │   ├─ ViT-B/16 face       │
-│                                                 │   └─ emotion2vec audio   │
-│                                                 ▼                          │
-│                              {dominant_emotion (8 classes), confidence,    │
-│                               stress / engagement / arousal}               │
-│                                                 │                          │
-│  Reachy speaker ◄─ TTS (gTTS + pydub) ◄─ Gemini response text              │
-│  Antennas / body ◄─ RecordedMove (emotion → move) ◄─────────────┘          │
-└────────────────────────────────────────────────────────────────────────────┘
+Laptop (tethered to Reachy Mini) — voice mode (default)
+
+  Reachy mic + camera ─► Gemini 3.8 Live (speech in/out, video ≤ 1 fps) ─► Reachy speaker
+                              │
+                              ├─ detect_emotion ──► latest reading of the local model:
+                              │     Reachy camera + mic ─► LocalEmotionInferencer (continuous)
+                              │       ─► EmotionDetector (full PyTorch on MPS, Two-Tower:
+                              │          ViT-B/16 face + emotion2vec audio)
+                              │       ─► {dominant_emotion (8 classes), confidence,
+                              │           stress / engagement / arousal}
+                              │       ─► antennas / body: RecordedMove (emotion → move)
+                              │
+                              └─ look_at_scene / plan_task ──► Gemini Robotics ER 2
+                                    (object points → head gaze; ordered arm steps)
 ```
 
-**Key design:** Gemini decides *when* to read emotion — it's an on-demand tool call. The emotion model runs in-process on the laptop, so inference has no network hop; the result is computed when the tool is called.
+**Key design:** the emotion model runs continuously in-process on the laptop (no network hop), and Gemini decides *when* to read it through the `detect_emotion` tool, which returns the latest reading. `--text` mode uses a turn-based pipeline instead: typed text → GeminiBridge (`gemini-3.5-flash`) → gTTS, with a fresh reading per tool call.
 
 ### Code structure
 
@@ -37,7 +33,9 @@ Emotion inference runs **on-device**: a Two-Tower Multimodal Transformer (ViT-B/
 src/reachy_emotion/
 ├── main.py               ← ReachyEmotionApp (dashboard entry point) + CLI
 ├── conversation_app.py   ← core conversation loop + emotion-source resolution
-├── gemini_bridge.py      ← Gemini chat session + detect_emotion tool
+├── live_conversation.py  ← voice mode: Gemini 3.8 Live streaming session + tools
+├── scene_brain.py        ← Gemini Robotics ER 2: look_at_scene / plan_task + head gaze
+├── gemini_bridge.py      ← Gemini chat session + detect_emotion tool (--text mode)
 ├── local_inferencer.py   ← LocalEmotionInferencer: in-process emotion model (default)
 ├── local_capture.py      ← camera+mic reader from the Reachy daemon (mini.media.*)
 ├── emotion_moves.py      ← emotion label → RecordedMove resolution (curated)
@@ -105,7 +103,9 @@ cp .env.example .env
 | `GEMINI_API_KEY` | Yes | From [aistudio.google.com](https://aistudio.google.com/app/apikey) |
 | `EMOTION_MODEL_PATH` | Yes\* | Path to the local checkpoint (`.pt`), e.g. `../emotion-detection-action/outputs/phase2_best_calibrated.pt`. |
 | `EMOTION_DEVICE` | No | Torch device for the local model. Default: `mps` |
-| `GEMINI_MODEL` | No | Default: `gemini-3.5-flash` |
+| `GEMINI_MODEL` | No | `--text` mode model. Default: `gemini-3.5-flash` |
+| `GEMINI_LIVE_MODEL` | No | Voice-mode Live model. Default: `gemini-3.8-live` |
+| `GEMINI_ER_MODEL` | No | Gemini Robotics ER model for the scene tools (`look_at_scene`, `plan_task`). Default: `gemini-robotics-er-2-preview` |
 | `GEMINI_SYSTEM_PROMPT` | No | Single-line override of Reachy's personality prompt |
 
 \* Required for emotion detection. If unset, emotion detection is disabled and Gemini still converses.
@@ -151,8 +151,8 @@ reachy-emotion --lang fr-FR                           # French
 | Flag | Description |
 |---|---|
 | `--text` | Type input instead of speaking |
-| `--lang CODE` | STT/TTS language, e.g. `en-US`, `fr-FR` (default: `en-US`) |
-| `--model NAME` | Override Gemini model |
+| `--lang CODE` | `--text` mode TTS language, e.g. `en-US`, `fr-FR` (default: `en-US`) |
+| `--model NAME` | `--text` mode Gemini model (voice mode uses `GEMINI_LIVE_MODEL`) |
 | `--prompt TEXT` | Override system prompt for this session |
 | `--sim` | Simulation mode |
 | `--media-backend` | Reachy media backend: `default`, `gstreamer`, `webrtc` |

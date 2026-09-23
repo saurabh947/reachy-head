@@ -32,8 +32,10 @@ try:
         to read how you're feeling.
 
         Configure via .env:
-            GEMINI_API_KEY   — required
-            GEMINI_MODEL     — optional (default: gemini-3.5-flash)
+            GEMINI_API_KEY      — required
+            EMOTION_MODEL_PATH  — local emotion checkpoint (unset = emotion disabled)
+            GEMINI_LIVE_MODEL   — optional (default: gemini-3.8-live)
+            GEMINI_ER_MODEL     — optional (default: gemini-robotics-er-2-preview)
         """
 
         custom_app_url: str | None = None
@@ -86,9 +88,10 @@ def main() -> None:
     parser.add_argument("--text", action="store_true",
                         help="Text mode: type input (voice mode uses Gemini Live streaming)")
     parser.add_argument("--lang", default="en-US",
-                        help="STT/TTS language code (default: en-US)")
+                        help="--text mode TTS language code (default: en-US)")
     parser.add_argument("--model", default=None,
-                        help="Gemini model name (default: from GEMINI_MODEL env or gemini-3.5-flash)")
+                        help="--text mode Gemini model (default: GEMINI_MODEL env or gemini-3.5-flash; "
+                             "voice mode uses GEMINI_LIVE_MODEL)")
     parser.add_argument("--media-backend", default="default",
                         choices=["default", "gstreamer", "webrtc"],
                         help="Reachy media backend")
@@ -128,12 +131,16 @@ def main() -> None:
             from reachy_emotion.conversation_app import _resolve_emotion_client
             from reachy_emotion.live_conversation import run_live_conversation
             emotion_client = _resolve_emotion_client(mini)
-            asyncio.run(run_live_conversation(
-                mini=mini,
-                stop_event=stop_event,
-                system_prompt=args.prompt,
-                emotion_client=emotion_client,
-            ))
+            try:
+                asyncio.run(run_live_conversation(
+                    mini=mini,
+                    stop_event=stop_event,
+                    system_prompt=args.prompt,
+                    emotion_client=emotion_client,
+                ))
+            except KeyboardInterrupt:
+                # Ctrl-C is how voice mode is stopped; cleanup already ran.
+                logger.info("Conversation stopped")
 
 
 if __name__ == "__main__":

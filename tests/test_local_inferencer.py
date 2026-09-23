@@ -69,7 +69,7 @@ def test_to_mono_downmixes_2d_and_passes_1d():
 
 def test_process_returns_cloud_compatible_dict():
     det = _FakeDetector()
-    inf = LocalEmotionInferencer(detector=det, warmup_frames=0)
+    inf = LocalEmotionInferencer(detector=det, warmup_s=0)
     inf.start()
     out = inf.process(_frame(), None)
     assert set(out) >= {
@@ -83,7 +83,7 @@ def test_process_returns_cloud_compatible_dict():
 
 def test_process_downmixes_audio_before_detector():
     det = _FakeDetector()
-    inf = LocalEmotionInferencer(detector=det, warmup_frames=0)
+    inf = LocalEmotionInferencer(detector=det, warmup_s=0)
     inf.start()
     stereo = np.ones((8, 2), dtype=np.float32)
     inf.process(_frame(), stereo)
@@ -91,20 +91,31 @@ def test_process_downmixes_audio_before_detector():
     assert audio_seen.ndim == 1 and audio_seen.shape == (8,)
 
 
-def test_warmup_flag_then_clears():
-    # warming is set while frame_count < warmup_frames; with warmup=3 that is
-    # the first two frames, then it clears from the 3rd onward.
-    det = _FakeDetector()
-    inf = LocalEmotionInferencer(detector=det, warmup_frames=3)
+def test_warmup_is_time_based_and_restarts_after_a_gap(monkeypatch):
+    # The SDK samples frames over the last 3 s of calls, so results are warming
+    # until the calls span 3 s; a gap longer than that empties its window.
+    import reachy_emotion.local_inferencer as li
+
+    now = [100.0]
+    monkeypatch.setattr(li.time, "monotonic", lambda: now[0])
+    inf = LocalEmotionInferencer(detector=_FakeDetector(), warmup_s=3.0)
     inf.start()
-    assert inf.process(_frame(), None).get("warming") is True   # frame_count=1 < 3
-    assert inf.process(_frame(), None).get("warming") is True   # frame_count=2 < 3
-    assert "warming" not in inf.process(_frame(), None)          # frame_count=3, not < 3
+
+    def warming_at(t):
+        now[0] = t
+        return inf.process(_frame(), None).get("warming", False)
+
+    assert warming_at(100.0) is True
+    assert warming_at(102.0) is True
+    assert warming_at(103.5) is False   # calls now span the 3 s window
+    assert warming_at(110.0) is True    # 6.5 s gap → the window restarted
+    inf.reset()
+    assert warming_at(110.5) is True    # reset restarts warm-up too
 
 
 def test_detect_emotion_returns_latest_after_process():
     det = _FakeDetector()
-    inf = LocalEmotionInferencer(detector=det, warmup_frames=0)
+    inf = LocalEmotionInferencer(detector=det, warmup_s=0)
     inf.start()
     inf.process(_frame(), None)
     assert inf.detect_emotion()["dominant_emotion"] == "happy"
@@ -112,16 +123,34 @@ def test_detect_emotion_returns_latest_after_process():
 
 def test_detect_emotion_one_shot_fallback_via_capture():
     det = _FakeDetector()
-    inf = LocalEmotionInferencer(detector=det, capture=_FakeCapture(_frame()), warmup_frames=0)
+    inf = LocalEmotionInferencer(detector=det, capture=_FakeCapture(_frame()), warmup_s=0)
     inf.start()
     # no process() yet → falls back to a one-shot capture read
     assert inf.detect_emotion()["dominant_emotion"] == "happy"
     assert len(det.calls) == 1
 
 
+def test_detect_emotion_rereads_when_latest_is_stale(monkeypatch):
+    # Text mode has no continuous loop: an old reading must not be replayed forever.
+    import reachy_emotion.local_inferencer as li
+
+    now = [100.0]
+    monkeypatch.setattr(li.time, "monotonic", lambda: now[0])
+    det = _FakeDetector()
+    inf = LocalEmotionInferencer(detector=det, capture=_FakeCapture(_frame()), warmup_s=0)
+    inf.start()
+    inf.detect_emotion()
+    now[0] += li._FRESH_S / 2
+    inf.detect_emotion()  # still fresh → served from latest, no new read
+    assert len(det.calls) == 1
+    now[0] += li._FRESH_S
+    inf.detect_emotion()  # stale → fresh capture + inference
+    assert len(det.calls) == 2
+
+
 def test_detect_emotion_unclear_when_no_capture_and_no_latest():
     det = _FakeDetector()
-    inf = LocalEmotionInferencer(detector=det, warmup_frames=0)
+    inf = LocalEmotionInferencer(detector=det, warmup_s=0)
     inf.start()
     out = inf.detect_emotion()
     assert out["dominant_emotion"] == "unclear"
@@ -130,7 +159,7 @@ def test_detect_emotion_unclear_when_no_capture_and_no_latest():
 
 def test_reset_clears_latest_and_counter():
     det = _FakeDetector()
-    inf = LocalEmotionInferencer(detector=det, warmup_frames=0)
+    inf = LocalEmotionInferencer(detector=det, warmup_s=0)
     inf.start()
     inf.process(_frame(), None)
     inf.reset()
